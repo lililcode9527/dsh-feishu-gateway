@@ -1,0 +1,6 @@
+# dsh-feishu-gateway-plugin bundle patch: applied automatically when this
+# package is listed in a profile's dsh.profile.bundles (or the row is copied
+# into the profile's cordis.patch.yml).
+- insert:
+    - id: feishu-gateway-plugin
+      name: dsh-feishu-gateway-plugin

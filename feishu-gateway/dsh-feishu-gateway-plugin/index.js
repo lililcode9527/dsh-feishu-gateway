@@ -46,7 +46,8 @@ export function apply(ctx) {
   const agents = ctx.get("agents");
   const sandboxPolicy = ctx.get("sandboxPolicy");
   const workspaceRoot = () => (sandboxPolicy && typeof sandboxPolicy.workspaceRoot === "string" ? sandboxPolicy.workspaceRoot : undefined);
-  const dshBase = `http://127.0.0.1:${ctx.webServer?.port ?? 3080}`;
+  const dshPort = ctx.webServer?.config?.port ?? ctx.webServer?.port ?? 3080;
+  const dshBase = `http://127.0.0.1:${dshPort}`;
   const dsh = new DshClient(dshBase);
 
   // ---- process-local state ----
