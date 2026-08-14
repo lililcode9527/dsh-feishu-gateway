@@ -93,18 +93,16 @@ powershell -ExecutionPolicy Bypass -File scripts\uninstall-autostart.ps1
 ```
 手动启动也可双击 `start-gateway.bat`（前台窗口，可看日志）。注意：自启任务和手动启动**二选一**，避免两个实例同时连飞书。
 
-### feishu_send（Agent 主动推送，可选）
-让 DSH 里的 Agent 能**主动**给手机发消息（不必等用户发话）。两步：
-1. 网关已内置收件口（启动日志显示 `feishu_send receiver on http://127.0.0.1:3180`，无需额外配置；令牌见 `data/gateway-send.json`）；
-2. 安装伴生插件到 DSH web profile（需重启 `dsh web` 生效）：
+### feishu_send（Agent 主动推送）
+让 DSH 里的 Agent 能**主动**给手机发消息（不必等用户发话）。**推荐使用深度集成插件** `dsh-feishu-gateway-plugin`（`feishu_send` 工具原生注册，无需收件口/伴生插件）：
 ```bash
-cd feishu-gateway
-dsh plugin --profile web add "file:./dsh-feishu-send"
-# 重启 dsh web 后生效
+cd 项目根
+dsh plugin --profile web add "file:<本插件目录>/dsh-feishu-gateway-plugin"
+# 配置 ~/.dsh-feishu/config.json（bots 数组），重启 dsh web 生效
 ```
-插件自动从 `~/.dsh-feishu-gateway.json`（网关启动时写入）或环境变量 `DSH_FEISHU_SEND_URL` / `DSH_FEISHU_SEND_TOKEN` 读取收件口信息。装好后，Agent 会话可直接调用工具 `feishu_send`（参数 `text`，可选 `appName` / `openId`），消息以 Markdown 卡片推送到你最近聊天的手机会话。
+装好后，Agent 会话可直接调用工具 `feishu_send`（参数 `text`，可选 `appId` / `chatId`），消息以 Markdown 卡片推送到目标会话。
 
-> 安全：收件口只监听 127.0.0.1 且需令牌校验。
+> 说明：独立版网关（本目录）也内置了 loopback 收件口（`127.0.0.1:3180`，令牌见 `data/gateway-send.json`），可配合旧的 `dsh-feishu-send` 伴生插件使用——但该伴生插件已被深度插件取代，**不再维护**；新部署请直接用深度插件。
 
 ### 用户白名单（已启用）
 `.env` 的 `ALLOWED_OPEN_IDS` 已填入你的 open_id，非该用户的消息会被拒绝。
