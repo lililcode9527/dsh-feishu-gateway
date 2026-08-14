@@ -422,17 +422,24 @@ export function apply(ctx) {
       }
     }, 3000);
 
+    const hadImage = messageType === "image";
     try {
       await agent.whenIdle();
     } catch (err) {
       console.log(`[feishu-gw] turn wait failed: ${err.message}`);
+      if (hadImage) {
+        await bot.feishu.sendMarkdown(chatId, chatId, "📷 收到图片，但当前模型不支持看图（或图片处理失败）。");
+      } else {
+        await bot.feishu.sendMarkdown(chatId, chatId, `❌ 任务执行失败：${err.message}`);
+      }
       return;
     } finally {
       poll();
     }
 
     const events = agent.session.events;
-    const reply = extractReply(events, seqBefore) || "（Agent 未产生文字回复）";
+    const rawReply = extractReply(events, seqBefore);
+    const reply = rawReply || (hadImage ? "📷 收到图片（当前模型未输出看图结果，可能不支持多模态）。" : "（Agent 未产生文字回复）");
     const files = collectFiles(events, seqBefore);
     const images = collectImages(events, seqBefore);
     const toolsUsed = new Set();
