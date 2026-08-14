@@ -56,6 +56,7 @@ export function apply(ctx) {
   const pendingApproval = new Map(); // openId -> { rpcId, sessionId, approvalId }
   const seen = new Map(); // `${appId}:${messageId}` -> expiry
   const MAX_SEEN = 2000;
+  const timers = new Map(); // `${botName}:${chatId}` -> [{ id, at, text, handle }]
   let lastConfigCheck = 0;
 
   // ---- config ----
@@ -211,11 +212,33 @@ export function apply(ctx) {
   const HELP = [
     "**飞书网关**",
     "",
-    "直接发消息 = 进入电脑端**当前打开的会话**（手机与桌面同一对话）。",
+    "直接发消息/图片 = 进入电脑端**当前打开的会话**（手机与桌面同一对话）。",
     "/list — 查看工作区会话（同电脑端侧边栏）",
+    "/timer <分钟> <内容> — 定时提醒（如：/timer 10 提醒我喝水）",
+    "/cancel — 取消本聊天的定时提醒并中断当前回合",
     "需要授权时点卡片按钮，提问回复编号即可。",
     "/help — 帮助",
   ].join("\n");
+
+  function registerTimer(bot, chatId, minutes, text) {
+    const key = `${bot.cfg.name}:${chatId}`;
+    const list = timers.get(key) ?? [];
+    const id = `t${Date.now().toString(36)}`;
+    const handle = setTimeout(() => {
+      timers.set(key, (timers.get(key) ?? []).filter((x) => x.id !== id));
+      void bot.feishu.sendMarkdown(chatId, chatId, `⏰ **定时提醒**：${text}`).catch(() => {});
+    }, Math.max(1, minutes) * 60000);
+    list.push({ id, at: Date.now() + minutes * 60000, text, handle });
+    timers.set(key, list);
+    return id;
+  }
+  function cancelTimers(bot, chatId) {
+    const key = `${bot.cfg.name}:${chatId}`;
+    const list = timers.get(key) ?? [];
+    for (const t of list) clearTimeout(t.handle);
+    timers.delete(key);
+    return list.length;
+  }
 
   /** List the workspace's sessions the way the desktop sidebar does. */
   async function listWorkspaceSessions(bot, chatId) {
@@ -248,8 +271,8 @@ export function apply(ctx) {
     }
   }
 
-  async function handleFeishuMessage(bot, { openId, chatId, text, messageId }) {
-    if (!messageId || !text) return;
+  async function handleFeishuMessage(bot, { openId, chatId, text, messageId, messageType = "text", contentRaw = "" }) {
+    if (!messageId) return;
     const key = `${bot.cfg.appId}:${messageId}`;
     const now = Date.now();
     if (seen.size > MAX_SEEN) for (const [k, exp] of seen) if (exp < now) seen.delete(k);
@@ -304,10 +327,55 @@ export function apply(ctx) {
 
     // commands
     if (text.startsWith("/")) {
-      const cmd = text.trim().toLowerCase();
+      const cmdLine = text.trim();
+      const cmd = cmdLine.toLowerCase().split(/\s+/)[0];
       if (cmd === "/help") return bot.feishu.sendMarkdown(chatId, chatId, HELP);
       if (cmd === "/list") return listWorkspaceSessions(bot, chatId);
+      if (cmd === "/timer") {
+        const m = cmdLine.match(/^\/timer\s+(\d+(?:\.\d+)?)\s+(.+)$/s);
+        if (!m) return bot.feishu.sendMarkdown(chatId, chatId, "用法：/timer <分钟> <内容>，如：/timer 10 提醒我喝水");
+        const minutes = Number(m[1]);
+        const body = m[2].trim();
+        registerTimer(bot, chatId, minutes, body);
+        return bot.feishu.sendMarkdown(chatId, chatId, `⏰ 已设定 ${minutes} 分钟后的提醒：「${body}」`);
+      }
+      if (cmd === "/cancel") {
+        const n = cancelTimers(bot, chatId);
+        // also interrupt the current agent turn if any
+        const sid = await currentSessionId(bot.cfg);
+        if (sid) {
+          try {
+            await dsh.call("session.cancel", { sessionId: sid });
+          } catch {}
+        }
+        return bot.feishu.sendMarkdown(chatId, chatId, n > 0 ? `🛑 已取消 ${n} 个定时提醒，并中断当前回合。` : "🛑 已中断当前回合。");
+      }
       return bot.feishu.sendMarkdown(chatId, chatId, "未知命令，发送 /help 查看。");
+    }
+
+    // non-text handling: images are downloaded and handed to the agent (看图)
+    let contentBlocks = [];
+    if (messageType === "image") {
+      let imageKey = "";
+      try {
+        imageKey = JSON.parse(contentRaw || "{}").image_key || "";
+      } catch {}
+      if (!imageKey) return bot.feishu.sendMarkdown(chatId, chatId, "收到图片但无法解析（image_key 缺失）。");
+      try {
+        const img = await bot.feishu.downloadImage(messageId, imageKey);
+        contentBlocks.push({ type: "image", mediaType: img.mediaType, data: img.data });
+      } catch (err) {
+        console.log(`[feishu-gw] image download failed: ${err.message}`);
+        return bot.feishu.sendMarkdown(chatId, chatId, `❌ 图片下载失败：${err.message}`);
+      }
+    } else if (messageType !== "text") {
+      // audio/file/other: ignore for now
+      return;
+    }
+    if (messageType === "text") {
+      contentBlocks.push({ type: "text", text: `[飞书 ${openId}] ${text}` });
+    } else if (text) {
+      contentBlocks.push({ type: "text", text: `[飞书 ${openId}] ${text}` });
     }
 
     // bridge to the desktop's CURRENT session in the bot's workspace
@@ -322,10 +390,16 @@ export function apply(ctx) {
 
     await bot.feishu.sendMarkdown(chatId, chatId, "🤖 已收到，开始处理…");
     const seqBefore = agent.session.events.length;
-    const message = { id: `feishu-${messageId}`, role: "user", content: [{ type: "text", text: `[飞书 ${openId}] ${text}` }], source: { kind: "user" } };
+    const message = { id: `feishu-${messageId}`, role: "user", content: contentBlocks, source: { kind: "user" } };
     agent.send(message, "next-turn", true);
 
-    const progress = { lastAt: 0, steps: 0, tools: new Set() };
+    // progress: one card, updated in place (no spam)
+    const progress = { lastAt: 0, steps: 0, tools: new Set(), cardId: null, sent: false };
+    const progressText = () => {
+      const parts = [`⏳ 进行中：已执行 ${progress.steps} 步`];
+      if (progress.tools.size) parts.push(`正在调用：${[...progress.tools].join("、")}`);
+      return parts.join("，");
+    };
     const poll = ctx.interval(() => {
       const events = agent.session.events;
       for (let i = seqBefore; i < events.length; i++) {
@@ -336,9 +410,14 @@ export function apply(ctx) {
       const nowMs = Date.now();
       if ((progress.tools.size || progress.steps) && nowMs - progress.lastAt >= 10000) {
         progress.lastAt = nowMs;
-        const parts = [`⏳ 进行中：已执行 ${progress.steps} 步`];
-        if (progress.tools.size) parts.push(`正在调用：${[...progress.tools].join("、")}`);
-        void bot.feishu.sendMarkdown(chatId, chatId, parts.join("，")).catch(() => {});
+        if (!progress.sent) {
+          progress.sent = true;
+          void bot.feishu.sendCard(chatId, progressText()).then((r) => {
+            progress.cardId = r.messageId;
+          }).catch(() => {});
+        } else if (progress.cardId) {
+          void bot.feishu.updateCard(chatId, progress.cardId, progressText()).catch(() => {});
+        }
         progress.tools = new Set();
       }
     }, 3000);

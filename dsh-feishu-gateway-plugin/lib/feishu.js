@@ -38,21 +38,26 @@ export class FeishuBot {
         const chatId = message.chat_id;
         const messageType = message.message_type ?? "text";
         const contentRaw = message.content ?? "";
-        if (!openId || messageType !== "text") return;
+        if (!openId) return;
+        // Forward every message type; the plugin decides what to do (text,
+        // image -> download for the agent, etc.)
         let text = "";
-        try {
-          const parsed = JSON.parse(contentRaw);
-          text = parsed.text ?? parsed.content ?? "";
-        } catch {
-          text = String(contentRaw ?? "");
+        if (messageType === "text") {
+          try {
+            const parsed = JSON.parse(contentRaw);
+            text = parsed.text ?? parsed.content ?? "";
+          } catch {
+            text = String(contentRaw ?? "");
+          }
         }
-        if (!text.trim()) return;
         if (this.messageHandler) {
           await this.messageHandler({
             openId,
             chatId,
             text: text.trim(),
             messageId: message.message_id,
+            messageType,
+            contentRaw,
           });
         }
       },
@@ -192,9 +197,47 @@ export class FeishuBot {
     if (!this.client) throw new Error("feishu client not initialized");
     const receiveId = chatId ?? openId;
     const receiveIdType = chatId ? "chat_id" : "open_id";
-    await this.client.im.v1.message.create({
+    const res = await this.client.im.v1.message.create({
       params: { receive_id_type: receiveIdType },
       data: { receive_id: receiveId, msg_type: msgType, content },
+    });
+    return res?.data?.message_id ? { messageId: res.data.message_id } : {};
+  }
+
+  /** Download an image resource from a received message (base64 + mediaType). */
+  async downloadImage(messageId, fileKey) {
+    if (this.dryRun) throw new Error("dry-run has no client");
+    if (!this.client) throw new Error("feishu client not initialized");
+    const res = await this.client.im.v1.messageResource.get({
+      path: { message_id: messageId, file_key: fileKey },
+      params: { type: "image" },
+    });
+    const stream = res?.getReadableStream?.();
+    if (!stream) throw new Error("message resource returned no stream");
+    const chunks = [];
+    for await (const c of stream) chunks.push(c);
+    const buf = Buffer.concat(chunks);
+    return { data: buf.toString("base64"), mediaType: "image/png" };
+  }
+
+  /** Send a markdown card and return its message id (for later updates). */
+  async sendCard(chatId, text) {
+    const card = { config: { wide_screen_mode: true }, elements: [{ tag: "markdown", content: text }] };
+    if (this.dryRun) {
+      console.log(`[feishu:dry] card -> ${chatId}: ${text.slice(0, 80)}`);
+      return {};
+    }
+    return this.sendMessage(chatId, chatId, "interactive", JSON.stringify(card));
+  }
+
+  /** Update an interactive card message in place (progress etc.). */
+  async updateCard(chatId, messageId, text) {
+    if (this.dryRun || !messageId) return;
+    const card = { config: { wide_screen_mode: true }, elements: [{ tag: "markdown", content: text }] };
+    if (!this.client) throw new Error("feishu client not initialized");
+    await this.client.im.v1.message.update({
+      path: { message_id: messageId },
+      data: { msg_type: "interactive", content: JSON.stringify(card) },
     });
   }
 }
