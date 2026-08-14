@@ -212,9 +212,41 @@ export function apply(ctx) {
     "**飞书网关**",
     "",
     "直接发消息 = 进入电脑端**当前打开的会话**（手机与桌面同一对话）。",
+    "/list — 查看工作区会话（同电脑端侧边栏）",
     "需要授权时点卡片按钮，提问回复编号即可。",
     "/help — 帮助",
   ].join("\n");
+
+  /** List the workspace's sessions the way the desktop sidebar does. */
+  async function listWorkspaceSessions(bot, chatId) {
+    const path = bot.cfg.workspace || workspaceRoot() || "";
+    const target = norm(path);
+    try {
+      const { items: wsList } = await dsh.call("workspace.list", {});
+      const ws = wsList.find((w) => norm(w.path) === target);
+      if (!ws) {
+        return bot.feishu.sendMarkdown(chatId, chatId, `未找到工作区：${path || "（未配置）"}`);
+      }
+      const { items: sessions } = await dsh.call("session.list", {});
+      const ids = new Set(ws.sessionIds ?? []);
+      const rows = sessions.filter((s) => ids.has(s.sessionId)).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 15);
+      const current = await currentSessionId(bot.cfg);
+      const lines = [`**工作区「${ws.title}」的会话**（▶️ = 当前，手机消息将进入）：`, ""];
+      for (const s of rows) {
+        let title = "";
+        try {
+          const h = await dsh.call("session.history", { sessionId: s.sessionId });
+          title = h.projections?.values?.title ?? "";
+        } catch {}
+        const mark = s.sessionId === current ? "▶️" : "⏸️";
+        lines.push(`${mark} ${title || "（无标题）"}（${s.sessionId.slice(-8)}）`);
+      }
+      lines.push("", "在电脑端打开某个会话，手机发消息就会进入它。");
+      return bot.feishu.sendMarkdown(chatId, chatId, lines.join("\n"));
+    } catch (err) {
+      return bot.feishu.sendMarkdown(chatId, chatId, `❌ 查询失败：${err.message}`);
+    }
+  }
 
   async function handleFeishuMessage(bot, { openId, chatId, text, messageId }) {
     if (!messageId || !text) return;
@@ -272,8 +304,10 @@ export function apply(ctx) {
 
     // commands
     if (text.startsWith("/")) {
-      if (text.trim().toLowerCase() === "/help") return bot.feishu.sendMarkdown(chatId, chatId, HELP);
-      return bot.feishu.sendMarkdown(chatId, chatId, `未知命令，发送 /help 查看。`);
+      const cmd = text.trim().toLowerCase();
+      if (cmd === "/help") return bot.feishu.sendMarkdown(chatId, chatId, HELP);
+      if (cmd === "/list") return listWorkspaceSessions(bot, chatId);
+      return bot.feishu.sendMarkdown(chatId, chatId, "未知命令，发送 /help 查看。");
     }
 
     // bridge to the desktop's CURRENT session in the bot's workspace
