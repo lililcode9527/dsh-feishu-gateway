@@ -1,0 +1,16 @@
+[
+  {
+    "name": "home-bot",
+    "appId": "cli_xxxxxxxxxxxxxxxx",
+    "appSecret": "your-app-secret",
+    "workspace": "C:\\Users\\you\\Desktop\\harness",
+    "allowedOpenIds": []
+  },
+  {
+    "name": "work-bot",
+    "appId": "cli_yyyyyyyyyyyyyyyy",
+    "appSecret": "another-app-secret",
+    "workspace": "C:\\Users\\you\\Desktop\\work",
+    "allowedOpenIds": ["ou_xxx"]
+  }
+]

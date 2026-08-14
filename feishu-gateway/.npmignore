@@ -1,0 +1,6 @@
+.env
+data/
+.npm-cache/
+test/
+tools/
+*.log
