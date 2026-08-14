@@ -1,12 +1,12 @@
 // dsh-feishu-gateway-plugin — DSH deep-integration host plugin.
-// Bridges Feishu (Lark) chats with dedicated agent sessions created through
-// ctx.agents (per-chat session pools, workspace-bound, model-injected), with
-// native feishu_send tool, approval/question cards (via the api-proxy mux +
+// Bridges Feishu (Lark) chats with the DESKTOP's current agent session in the
+// configured workspace: phone messages go straight into the session the user
+// is looking at (most recently active in the bot's workspace), with native
+// feishu_send tool, approval/question cards (via the api-proxy mux +
 // /api/respond), progress pings, image/file delivery, and admin routes for a
-// settings-page client.
+// settings-page panel.
 //
 // Config: ~/.dsh-feishu/config.json  { bots: [{ name, appId, appSecret, workspace, allowedOpenIds?, ownerOpenId? }] }
-// State:  ~/.dsh-feishu/state-<appId>.json  (per-chat session pools)
 
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -22,7 +22,6 @@ export const inject = ["agents", "timer", "webServer", "tools"];
 
 const baseConfigDir = () => process.env.DSH_FEISHU_CONFIG_DIR || join(homedir(), ".dsh-feishu");
 const configPath = () => join(baseConfigDir(), "config.json");
-const statePath = (appId) => join(baseConfigDir(), `state-${String(appId).replace(/[^a-zA-Z0-9]/g, "")}.json`);
 
 const norm = (p) => (typeof p === "string" ? p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() : "");
 
@@ -34,10 +33,10 @@ function readJson(file, fallback) {
 }
 function writeJson(file, value) {
   try {
-    mkdirSync(join(homedir(), ".dsh-feishu"), { recursive: true });
+    mkdirSync(baseConfigDir(), { recursive: true });
     writeFileSync(file, JSON.stringify(value, null, 2));
   } catch (err) {
-    console.log(`[feishu-gw] state save failed: ${err.message}`);
+    console.log(`[feishu-gw] save failed: ${err.message}`);
   }
 }
 
@@ -52,7 +51,7 @@ export function apply(ctx) {
 
   // ---- process-local state ----
   const bots = new Map(); // appId -> Bot runtime
-  const sessionOwner = new Map(); // dedicated sessionId -> { botName, chatId, openId }
+  const sessionOwner = new Map(); // sessionId -> { botName, chatId, openId }
   const pendingQuestion = new Map(); // openId -> { rpcId, sessionId, questions }
   const pendingApproval = new Map(); // openId -> { rpcId, sessionId, approvalId }
   const seen = new Map(); // `${appId}:${messageId}` -> expiry
@@ -80,116 +79,66 @@ export function apply(ctx) {
   }
   const readConfig = () => normalizeConfig(readJson(configPath(), {}));
 
-  // ---- agent session helpers (dedicated, workspace-bound, model-injected) ----
+  // ---- resolve the DESKTOP current session in the bot's workspace ----
   const defaultAgentOptions = () => {
     const sel = ctx.get("agentDefaultModel");
     const cur = sel && typeof sel.currentSelection === "function" ? sel.currentSelection() : undefined;
     return cur && cur.provider && cur.model ? { provider: cur.provider, model: cur.model } : undefined;
   };
-  async function createDedicated(bot, sessionId, mainAgent) {
-    const cfg = bot.cfg;
-    const opts = defaultAgentOptions();
-    return agents.create({
-      sessionId,
-      meta: {
-        cwd: (cfg.workspace && String(cfg.workspace).trim()) || workspaceRoot() || undefined,
-        ...mainAgent && mainAgent.session?.header?.agentPreset ? { agentPreset: mainAgent.session.header.agentPreset } : {},
-      },
-      ...opts ? { agentOptions: opts } : {},
-      setup: async (agentCtx) => {
-        const presets = agentCtx.get("agentPresets");
-        if (!presets) return;
-        try {
-          if (mainAgent) presets.composeFrom(agentCtx, mainAgent.ctx);
-          else await presets.mount(agentCtx);
-        } catch (err) {
-          console.log(`[feishu-gw] preset setup failed: ${err.message}`);
-        }
-      },
-    });
-  }
-  async function resumeDedicated(bot, sessionId, mainAgent) {
-    const opts = defaultAgentOptions();
-    return agents.resume({
-      resumeSessionId: sessionId,
-      ...opts ? { agentOptions: opts } : {},
-      setup: async (agentCtx) => {
-        if (!mainAgent) return;
-        const presets = agentCtx.get("agentPresets");
-        if (!presets) return;
-        try {
-          presets.composeFrom(agentCtx, mainAgent.ctx);
-        } catch (err) {
-          console.log(`[feishu-gw] resume composeFrom failed: ${err.message}`);
-        }
-      },
-    });
-  }
-  const chatSessionId = (chatId, n) => `feishu-${String(chatId).replace(/[^a-zA-Z0-9]/g, "").slice(0, 12)}-${n}-${Date.now().toString(36)}`;
 
-  // ---- per-bot runtime ----
-  function makeBot(cfg) {
-    const bot = {
-      cfg,
-      feishu: null,
-      status: "",
-      chain: Promise.resolve(),
-      lastChatId: "",
-      chats: new Map(),
-      stateCache: undefined,
-    };
-    bot.ensureChat = async (chatId) => {
-      const hit = bot.chats.get(chatId);
-      if (hit) return hit;
-      const state = bot.loadState();
-      const record = state.chats?.[chatId];
-      const chat = { sessions: [], activeIndex: 0 };
-      if (record && Array.isArray(record.sessions) && record.sessions.length > 0) {
-        for (const s of record.sessions) {
-          chat.sessions.push({ id: String(s.id), label: typeof s.label === "string" && s.label ? s.label : "会话" });
-        }
-        const ai = record.sessions.findIndex((s) => s && s.id === record.active);
-        chat.activeIndex = ai >= 0 ? ai : 0;
-      }
-      bot.chats.set(chatId, chat);
-      return chat;
-    };
-    bot.loadState = () => {
-      if (bot.stateCache !== undefined) return bot.stateCache;
-      bot.stateCache = readJson(statePath(cfg.appId), { chats: {} });
-      return bot.stateCache;
-    };
-    bot.saveState = () => writeJson(statePath(cfg.appId), bot.loadState());
-    bot.persistChat = async (chatId, chat) => {
-      const state = bot.loadState();
-      if (!state.chats) state.chats = {};
-      state.chats[chatId] = {
-        sessions: chat.sessions.map((s) => ({ id: s.id, label: s.label })),
-        active: chat.sessions[chat.activeIndex] ? chat.sessions[chat.activeIndex].id : (chat.sessions[0]?.id ?? ""),
-      };
-      bot.saveState();
-    };
-    bot.resolveActiveAgent = async (chat, mainAgent) => {
-      const entry = chat.sessions[chat.activeIndex];
-      if (!entry) return undefined;
-      if (entry.handle) return entry.handle.agent;
-      try {
-        const handle = await resumeDedicated(bot, entry.id, mainAgent);
-        entry.handle = handle;
-        const sid = entry.id;
-        sessionOwner.set(sid, { botName: cfg.name, chatId: chatIdOf(bot, chat), openId: "" });
-        return handle.agent;
-      } catch (err) {
-        console.log(`[feishu-gw] resume failed ${entry.id}: ${err.message}`);
-        return undefined;
-      }
-    };
-    return bot;
+  /** sessionId of the most recently active session in the bot's workspace. */
+  async function currentSessionId(cfg) {
+    const path = cfg.workspace || workspaceRoot() || "";
+    const target = norm(path);
+    if (!target) return undefined;
+    try {
+      const { items: wsList } = await dsh.call("workspace.list", {});
+      const ws = wsList.find((w) => norm(w.path) === target);
+      if (!ws) return undefined;
+      const { items: sessions } = await dsh.call("session.list", {});
+      const ids = new Set(ws.sessionIds ?? []);
+      const inWs = sessions.filter((s) => ids.has(s.sessionId));
+      if (!inWs.length) return undefined;
+      inWs.sort((a, b) => b.updatedAt - a.updatedAt);
+      return inWs[0].sessionId;
+    } catch (err) {
+      console.log(`[feishu-gw] currentSessionId failed: ${err.message}`);
+      return undefined;
+    }
   }
-  // reverse chat lookup for sessionOwner (chatId is the key in bot.chats)
-  function chatIdOf(bot, chat) {
-    for (const [k, v] of bot.chats) if (v === chat) return k;
-    return "";
+
+  /** The live agent for that session (resume if not live). */
+  async function resolveAgent(sessionId) {
+    const live = agents.roots().find((a) => a.id === sessionId) || agents.list().find((a) => a.id === sessionId);
+    if (live) return live;
+    const opts = defaultAgentOptions();
+    try {
+      const handle = await agents.resume({
+        resumeSessionId: sessionId,
+        ...opts ? { agentOptions: opts } : {},
+      });
+      return handle.agent;
+    } catch (err) {
+      console.log(`[feishu-gw] resume failed ${sessionId}: ${err.message}`);
+      return undefined;
+    }
+  }
+
+  /** Create a session in the bot's workspace (when the workspace has none yet). */
+  async function createWorkspaceSession(cfg) {
+    const path = cfg.workspace || workspaceRoot() || undefined;
+    const opts = defaultAgentOptions();
+    try {
+      const handle = await agents.create({
+        sessionId: `feishu-${Date.now().toString(36)}`,
+        meta: { ...(path ? { cwd: path } : {}) },
+        ...opts ? { agentOptions: opts } : {},
+      });
+      return handle.agent;
+    } catch (err) {
+      console.log(`[feishu-gw] create failed: ${err.message}`);
+      return undefined;
+    }
   }
 
   // ---- Feishu message flow ----
@@ -231,17 +180,15 @@ export function apply(ctx) {
     }
     return refs;
   }
-
   async function pushFiles(bot, chatId, paths) {
-    const cfg = bot.cfg;
-    const base = cfg.workspace || workspaceRoot() || process.cwd();
+    const base = bot.cfg.workspace || workspaceRoot() || process.cwd();
     let sent = 0;
     for (const raw of paths.slice(0, 3)) {
       const abs = isAbsolute(raw) ? raw : resolve(base, raw);
       try {
         const st = statSync(abs, { throwIfNoEntry: false });
         if (!st || !st.isFile() || st.size === 0 || st.size > 20 * 1024 * 1024) continue;
-        const buffer = readFile(abs);
+        const buffer = readFileSync(abs);
         await bot.feishu.sendFile(chatId, chatId, { fileName: basename(abs), buffer });
         sent++;
       } catch (err) {
@@ -261,75 +208,13 @@ export function apply(ctx) {
     }
   }
 
-  const COMMANDS = ["help", "new", "switch", "list", "workspace"];
-  function resolveCommand(raw) {
-    if (!raw) return undefined;
-    const exact = COMMANDS.find((c) => c === raw);
-    if (exact) return exact;
-    const prefix = COMMANDS.filter((c) => c.startsWith(raw));
-    return prefix.length === 1 ? prefix[0] : undefined;
-  }
   const HELP = [
-    "**飞书网关命令**",
+    "**飞书网关**",
     "",
-    "/new [名称] — 新建独立会话并切换",
-    "/switch <序号> — 切换会话（/list 查看）",
-    "/list — 列出本聊天的全部会话",
-    "/workspace [序号|名称|路径] — 查看/切换工作区",
+    "直接发消息 = 进入电脑端**当前打开的会话**（手机与桌面同一对话）。",
+    "需要授权时点卡片按钮，提问回复编号即可。",
     "/help — 帮助",
   ].join("\n");
-
-  async function handleCommand(bot, chatId, line) {
-    const parts = String(line).trim().split(/\s+/);
-    const cmd = resolveCommand((parts[0] || "").toLowerCase().replace(/^\//, ""));
-    if (!cmd) {
-      await bot.feishu.sendMarkdown(chatId, chatId, `未知命令 \`${parts[0]}\`，发送 /help 查看。`);
-      return;
-    }
-    const chat = await bot.ensureChat(chatId);
-    const mainAgent = pickMainAgent(bot.cfg);
-    if (cmd === "help") return bot.feishu.sendMarkdown(chatId, chatId, HELP);
-    if (cmd === "list") {
-      const lines = ["**会话列表**", ""];
-      chat.sessions.forEach((s, i) => lines.push(`${i + 1}. ${s.label}${i === chat.activeIndex ? "（当前）" : ""}`));
-      lines.push("", "发送 /switch <序号> 切换");
-      return bot.feishu.sendMarkdown(chatId, chatId, lines.join("\n"));
-    }
-    if (cmd === "new") {
-      const label = parts.slice(1).join(" ").trim() || `会话 ${chat.sessions.length + 1}`;
-      try {
-        const sessionId = chatSessionId(chatId, chat.sessions.length);
-        const handle = await createDedicated(bot, sessionId, mainAgent);
-        chat.sessions.push({ id: sessionId, label, handle });
-        chat.activeIndex = chat.sessions.length - 1;
-        sessionOwner.set(sessionId, { botName: bot.cfg.name, chatId, openId: "" });
-        await bot.persistChat(chatId, chat);
-        return bot.feishu.sendMarkdown(chatId, chatId, `已创建独立会话 **${label}** 并切换。`);
-      } catch (err) {
-        return bot.feishu.sendMarkdown(chatId, chatId, `创建会话失败：${err.message}`);
-      }
-    }
-    if (cmd === "switch") {
-      const n = Number(parts[1]);
-      if (!Number.isInteger(n) || n < 1 || n > chat.sessions.length) {
-        return bot.feishu.sendMarkdown(chatId, chatId, `无效序号，发送 /list 查看。`);
-      }
-      chat.activeIndex = n - 1;
-      await bot.persistChat(chatId, chat);
-      return bot.feishu.sendMarkdown(chatId, chatId, `已切换到 **${chat.sessions[n - 1].label}**。`);
-    }
-    if (cmd === "workspace") {
-      const arg = parts.slice(1).join(" ").trim();
-      return bot.feishu.sendMarkdown(chatId, chatId, `工作区由各机器人配置（config.json 的 workspace）决定；切换请编辑配置后重启。当前：\`${bot.cfg.workspace || workspaceRoot() || "未配置"}\``);
-    }
-  }
-
-  function pickMainAgent(cfg) {
-    const target = norm(cfg.workspace || workspaceRoot() || "");
-    if (!target) return undefined;
-    const matches = (a) => norm(a?.session?.header?.cwd) === target;
-    return agents.roots().find(matches) || agents.list().find(matches);
-  }
 
   async function handleFeishuMessage(bot, { openId, chatId, text, messageId }) {
     if (!messageId || !text) return;
@@ -386,34 +271,26 @@ export function apply(ctx) {
     }
 
     // commands
-    if (text.startsWith("/")) return handleCommand(bot, chatId, text);
-
-    // bridge to a dedicated session
-    const chat = await bot.ensureChat(chatId);
-    let agent = await bot.resolveActiveAgent(chat, pickMainAgent(bot.cfg));
-    if (!agent) {
-      try {
-        const sessionId = chatSessionId(chatId, chat.sessions.length);
-        const handle = await createDedicated(bot, sessionId, pickMainAgent(bot.cfg));
-        agent = handle.agent;
-        chat.sessions = [{ id: sessionId, label: "主会话", handle }];
-        chat.activeIndex = 0;
-        sessionOwner.set(sessionId, { botName: bot.cfg.name, chatId, openId });
-        await bot.persistChat(chatId, chat);
-      } catch (err) {
-        console.log(`[feishu-gw] auto-create failed: ${err.stack ?? err.message}`);
-        return bot.feishu.sendMarkdown(chatId, chatId, `创建 Agent 会话失败：${err.message}`);
-      }
+    if (text.startsWith("/")) {
+      if (text.trim().toLowerCase() === "/help") return bot.feishu.sendMarkdown(chatId, chatId, HELP);
+      return bot.feishu.sendMarkdown(chatId, chatId, `未知命令，发送 /help 查看。`);
     }
-    const sid = agent.id || chat.sessions[chat.activeIndex].id;
-    sessionOwner.set(sid, { botName: bot.cfg.name, chatId, openId });
+
+    // bridge to the desktop's CURRENT session in the bot's workspace
+    let sessionId = await currentSessionId(bot.cfg);
+    let agent = sessionId ? await resolveAgent(sessionId) : undefined;
+    if (!agent) {
+      agent = await createWorkspaceSession(bot.cfg);
+      if (!agent) return bot.feishu.sendMarkdown(chatId, chatId, "无法获取当前会话：请先在电脑端打开一个会话，或检查工作区配置。");
+      sessionId = agent.id;
+    }
+    sessionOwner.set(sessionId, { botName: bot.cfg.name, chatId, openId });
 
     await bot.feishu.sendMarkdown(chatId, chatId, "🤖 已收到，开始处理…");
     const seqBefore = agent.session.events.length;
     const message = { id: `feishu-${messageId}`, role: "user", content: [{ type: "text", text: `[飞书 ${openId}] ${text}` }], source: { kind: "user" } };
     agent.send(message, "next-turn", true);
 
-    // progress polling while the turn runs
     const progress = { lastAt: 0, steps: 0, tools: new Set() };
     const poll = ctx.interval(() => {
       const events = agent.session.events;
@@ -453,7 +330,7 @@ export function apply(ctx) {
     const parts = [reply];
     if (toolsUsed.size) parts.push(`🔧 使用工具：${[...toolsUsed].join("、")}`);
     await bot.feishu.sendMarkdown(chatId, chatId, parts.join("\n\n"));
-    if (images.length) await pushImages(bot, chatId, images, sid);
+    if (images.length) await pushImages(bot, chatId, images, sessionId);
     if (files.length) await pushFiles(bot, chatId, files);
   }
 
@@ -510,7 +387,7 @@ export function apply(ctx) {
     for (const cfg of list) {
       let bot = bots.get(cfg.appId);
       if (!bot) {
-        bot = makeBot(cfg);
+        bot = { cfg, feishu: null, status: "", chain: Promise.resolve(), lastChatId: "" };
         bots.set(cfg.appId, bot);
       } else {
         bot.cfg = cfg;
@@ -561,7 +438,7 @@ export function apply(ctx) {
       const list = readConfig();
       let bot;
       if (args.appId) {
-        bot = bots.get(args.appId) || makeBot(list.find((c) => c.appId === args.appId) || {});
+        bot = bots.get(args.appId) || { cfg: list.find((c) => c.appId === args.appId) || {}, feishu: null, lastChatId: "" };
         if (!bot.cfg.appId) return { ok: false, detail: `未找到 appId=${args.appId} 的机器人` };
       } else {
         bot = [...bots.values()].sort((a, b) => String(b.lastChatId).localeCompare(String(a.lastChatId)))[0];
@@ -578,7 +455,7 @@ export function apply(ctx) {
     },
   });
 
-  // ---- admin routes (settings-page client) ----
+  // ---- admin routes (settings-page panel) ----
   const respondJson = (res, status, obj) => {
     res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify(obj));
@@ -727,13 +604,7 @@ export function apply(ctx) {
         return respondJson(res, 200, { ok: false, error: String(data.error), message: String(data.error_description || data.error) });
       }
       if (typeof data.client_id === "string" && typeof data.client_secret === "string" && data.client_id && data.client_secret) {
-        return respondJson(res, 200, {
-          ok: true,
-          done: true,
-          appId: data.client_id,
-          appSecret: data.client_secret,
-          ownerOpenId: data.user_info?.open_id || "",
-        });
+        return respondJson(res, 200, { ok: true, done: true, appId: data.client_id, appSecret: data.client_secret, ownerOpenId: data.user_info?.open_id || "" });
       }
       respondJson(res, 200, { ok: true, done: false, pending: true });
     } catch (err) {
@@ -741,7 +612,7 @@ export function apply(ctx) {
     }
   });
 
-  // ---- self-contained settings panel (served at /feishu/admin/panel) ----
+  // ---- self-contained settings panel ----
   ctx.effect(() =>
     ctx.webServer.register({
       kind: "exact",
