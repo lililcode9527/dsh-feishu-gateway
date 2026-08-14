@@ -28,7 +28,7 @@ const norm = (p) => (typeof p === "string" ? p.replace(/\\/g, "/").replace(/\/+$
 
 function readJson(file, fallback) {
   try {
-    if (existsSync(file)) return JSON.parse(readFileSync(file, "utf8"));
+    if (existsSync(file)) return JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, "")); // strip UTF-8 BOM
   } catch {}
   return fallback;
 }
