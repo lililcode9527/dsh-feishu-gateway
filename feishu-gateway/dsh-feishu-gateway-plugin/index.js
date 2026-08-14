@@ -15,6 +15,7 @@ import { join, isAbsolute, resolve, basename } from "node:path";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { FeishuBot } from "./lib/feishu.js";
 import { DshClient } from "./lib/dsh.js";
+import { adminPanelHtml } from "./lib/admin-panel.js";
 
 export const name = "feishu-gateway-plugin";
 export const inject = ["agents", "timer", "webServer", "tools"];
@@ -678,6 +679,79 @@ export function apply(ctx) {
       respondJson(res, 200, { ok: false, detail: String(err.message) });
     }
   });
+
+  // ---- scan-to-create onboarding (Feishu official device flow) ----
+  const onboardingBase = "https://accounts.feishu.cn/oauth/v1/app/registration";
+  const onboardingForm = (params) => {
+    const parts = Object.entries(params).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`);
+    return { body: parts.join("&"), headers: { "Content-Type": "application/x-www-form-urlencoded" } };
+  };
+  route("/feishu/admin/onboard", "POST", async (req, res) => {
+    try {
+      const init = onboardingForm({ action: "init" });
+      const initRes = await fetch(onboardingBase, { method: "POST", headers: init.headers, body: init.body });
+      const initData = await initRes.json();
+      if (!Array.isArray(initData.supported_auth_methods) || !initData.supported_auth_methods.some((m) => String(m).toLowerCase() === "client_secret")) {
+        return respondJson(res, 200, { ok: false, message: "当前环境不支持 client_secret 认证方式" });
+      }
+      const begin = onboardingForm({ action: "begin", archetype: "PersonalAgent", auth_method: "client_secret", request_user_info: "open_id" });
+      const beginRes = await fetch(onboardingBase, { method: "POST", headers: begin.headers, body: begin.body });
+      const beginData = await beginRes.json();
+      if (beginData.error) return respondJson(res, 200, { ok: false, message: String(beginData.error) + ": " + String(beginData.error_description || "") });
+      if (!beginData.device_code || !beginData.verification_uri_complete) return respondJson(res, 200, { ok: false, message: "onboarding 响应不完整" });
+      respondJson(res, 200, {
+        ok: true,
+        deviceCode: beginData.device_code,
+        qrContent: beginData.verification_uri_complete,
+        userCode: String(beginData.user_code || ""),
+        expiresIn: Number(beginData.expires_in) || 3600,
+        interval: Number(beginData.interval) || 5,
+      });
+    } catch (err) {
+      respondJson(res, 500, { ok: false, message: String(err.message) });
+    }
+  });
+  route("/feishu/admin/onboard/poll", "POST", async (req, res) => {
+    let body;
+    try {
+      body = JSON.parse(await readBody(req, 65536)) || {};
+    } catch {
+      return respondJson(res, 400, { ok: false, message: "invalid json" });
+    }
+    try {
+      const form = onboardingForm({ action: "poll", device_code: body.deviceCode });
+      const r = await fetch(onboardingBase, { method: "POST", headers: form.headers, body: form.body });
+      const data = await r.json();
+      if (data.error && data.error !== "authorization_pending") {
+        return respondJson(res, 200, { ok: false, error: String(data.error), message: String(data.error_description || data.error) });
+      }
+      if (typeof data.client_id === "string" && typeof data.client_secret === "string" && data.client_id && data.client_secret) {
+        return respondJson(res, 200, {
+          ok: true,
+          done: true,
+          appId: data.client_id,
+          appSecret: data.client_secret,
+          ownerOpenId: data.user_info?.open_id || "",
+        });
+      }
+      respondJson(res, 200, { ok: true, done: false, pending: true });
+    } catch (err) {
+      respondJson(res, 500, { ok: false, message: String(err.message) });
+    }
+  });
+
+  // ---- self-contained settings panel (served at /feishu/admin/panel) ----
+  ctx.effect(() =>
+    ctx.webServer.register({
+      kind: "exact",
+      path: "/feishu/admin/panel",
+      handler: (req, res) => {
+        if (req.method !== "GET") return respondJson(res, 405, { ok: false, message: "method not allowed" });
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(adminPanelHtml());
+      },
+    })
+  );
 
   // ---- lifecycle ----
   dsh.connect();
