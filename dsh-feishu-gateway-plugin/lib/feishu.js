@@ -11,6 +11,7 @@ export class FeishuBot {
     this.wsClient = null;
     this.messageHandler = null;
     this.cardHandler = null;
+    this.statusHandler = null;
     this.dryRun = !appId || !appSecret;
   }
 
@@ -22,6 +23,18 @@ export class FeishuBot {
     this.cardHandler = handler;
   }
 
+  /** Watch WS lifecycle: { event: 'ready'|'reconnecting'|'reconnected'|'error', message, at } */
+  onStatusChange(handler) {
+    this.statusHandler = handler;
+  }
+
+  emitStatus(event, err) {
+    if (!this.statusHandler) return;
+    try {
+      this.statusHandler({ event, message: err?.message || "", at: Date.now() });
+    } catch {}
+  }
+
   async start() {
     if (this.dryRun) {
       console.warn("[feishu] dry-run mode: no FEISHU_APP_ID/FEISHU_APP_SECRET, outgoing messages will be logged only");
@@ -29,7 +42,15 @@ export class FeishuBot {
     }
     const lark = await import("@larksuiteoapi/node-sdk");
     this.client = new lark.Client({ appId: this.appId, appSecret: this.appSecret });
-    this.wsClient = new lark.WSClient({ appId: this.appId, appSecret: this.appSecret, loggerLevel: lark.LoggerLevel.info });
+    this.wsClient = new lark.WSClient({
+      appId: this.appId,
+      appSecret: this.appSecret,
+      loggerLevel: lark.LoggerLevel.info,
+      onReady: () => this.emitStatus("ready"),
+      onReconnecting: () => this.emitStatus("reconnecting"),
+      onReconnected: () => this.emitStatus("reconnected"),
+      onError: (err) => this.emitStatus("error", err),
+    });
     const dispatcher = new lark.EventDispatcher({}).register({
       "im.message.receive_v1": async (data) => {
         const sender = data?.sender ?? {};

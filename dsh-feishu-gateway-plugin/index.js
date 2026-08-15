@@ -78,6 +78,7 @@ export function apply(ctx) {
   const seen = new Map(); // `${appId}:${messageId}` -> expiry
   const MAX_SEEN = 2000;
   const timers = new Map(); // `${botName}:${chatId}` -> [{ id, at, text, handle }]
+  const alertLog = new Map(); // appId -> { type, at } for connection-alert cooldowns
   let lastConfigCheck = 0;
 
   // ---- config ----
@@ -709,6 +710,22 @@ export function apply(ctx) {
   });
 
   // ---- lifecycle: one FeishuBot per configured bot, hot-read config ----
+
+  /** Push a connection alert to the bot owner (private chat), cooldown-guarded. */
+  function alertOwner(bot, icon, text, at, restore = false) {
+    const target = bot.cfg.ownerOpenId || (bot.cfg.allowedOpenIds || [])[0];
+    if (!target) return;
+    const type = restore ? "restore" : "alert";
+    const prev = alertLog.get(bot.cfg.appId);
+    const cooldown = restore ? 60000 : 600000; // restore 1 min, alert 10 min
+    if (prev && prev.type === type && at - prev.at < cooldown) return;
+    alertLog.set(bot.cfg.appId, { type, at });
+    const t = new Date(at).toLocaleString("zh-CN", { hour12: false });
+    void bot.feishu
+      .sendMarkdown(target, undefined, `${icon} **飞书网关告警**（${bot.cfg.name}）\n${text}\n\n🕐 ${t}`)
+      .catch(() => {});
+  }
+
   async function ensureBots() {
     const now = Date.now();
     if (now - lastConfigCheck < 10000) return;
@@ -747,6 +764,20 @@ export function apply(ctx) {
             await bot.feishu.sendMarkdown(chatId ?? openId, chatId, `❌ 审批失败：${err.message}`);
           }
         });
+        bot.feishu.onStatusChange(({ event, message, at }) => {
+          if (event === "ready") {
+            bot.status = "connected";
+          } else if (event === "reconnecting") {
+            bot.status = "reconnecting";
+            alertOwner(bot, "🔌", "飞书连接断开，正在自动重连…", at);
+          } else if (event === "reconnected") {
+            bot.status = "connected";
+            alertOwner(bot, "✅", "飞书连接已恢复。", at, true);
+          } else if (event === "error") {
+            bot.status = `error: ${message}`;
+            alertOwner(bot, "🚨", `飞书连接异常：${message || "未知错误"}`, at);
+          }
+        });
         try {
           await bot.feishu.start();
           bot.status = "connected";
@@ -754,6 +785,7 @@ export function apply(ctx) {
         } catch (err) {
           bot.status = `error: ${err.message}`;
           console.log(`[feishu-gw] bot "${cfg.name}" start failed: ${err.message}`);
+          alertOwner(bot, "🚨", `飞书机器人启动失败：${err.message}`, Date.now());
         }
       }
     }
