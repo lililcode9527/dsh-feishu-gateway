@@ -109,11 +109,20 @@ export function apply(ctx) {
     }
   }
 
+  /** agentOptions for a session: its own stored model selection, else the deployment default. */
+  async function sessionAgentOptions(sessionId) {
+    try {
+      const m = await dsh.call("session.models", { sessionId });
+      if (m?.current?.provider && m?.current?.model) return { provider: m.current.provider, model: m.current.model };
+    } catch {}
+    return defaultAgentOptions();
+  }
+
   /** The live agent for that session (resume if not live). */
   async function resolveAgent(sessionId) {
     const live = agents.roots().find((a) => a.id === sessionId) || agents.list().find((a) => a.id === sessionId);
     if (live) return live;
-    const opts = defaultAgentOptions();
+    const opts = await sessionAgentOptions(sessionId);
     try {
       const handle = await agents.resume({
         resumeSessionId: sessionId,
@@ -215,6 +224,7 @@ export function apply(ctx) {
     "",
     "直接发消息/图片 = 进入电脑端**当前打开的会话**（手机与桌面同一对话）。",
     "/list — 查看所有工作区及会话（同电脑端侧边栏）",
+    "/model — 查看当前模型与可用列表；/model <编号> 切换模型",
     "/timer <分钟> <内容> — 定时提醒（如：/timer 10 提醒我喝水）",
     "/cancel — 取消本聊天的定时提醒并中断当前回合",
     "需要授权时点卡片按钮，提问回复编号即可。",
@@ -282,6 +292,58 @@ export function apply(ctx) {
     }
   }
 
+  /** Show current session model + selectable list, or switch by index (/model <N>). */
+  async function handleModelCommand(bot, chatId, arg) {
+    const sid = await currentSessionId(bot.cfg);
+    if (!sid) return bot.feishu.sendMarkdown(chatId, chatId, "找不到当前会话，无法查看/切换模型。");
+    let models;
+    try {
+      models = await dsh.call("session.models", { sessionId: sid });
+    } catch (err) {
+      return bot.feishu.sendMarkdown(chatId, chatId, `❌ 获取模型列表失败：${err.message}`);
+    }
+    const current = models.current;
+    const groups = models.groups ?? [];
+    const flat = [];
+    for (const g of groups) for (const m of g.models) flat.push({ provider: g.id, id: m.id, name: m.name });
+    const isCur = (p) => current && current.provider === p.provider && current.model === p.id;
+
+    if (arg) {
+      const idx = Number(arg);
+      if (!Number.isInteger(idx) || idx < 1 || idx > flat.length) {
+        return bot.feishu.sendMarkdown(chatId, chatId, `❌ 参数无效：/model <编号>，编号范围 1-${flat.length}（发 /model 查看列表）`);
+      }
+      const pick = flat[idx - 1];
+      if (isCur(pick)) return bot.feishu.sendMarkdown(chatId, chatId, `已经是该模型：${pick.provider}/${pick.id}。`);
+      try {
+        const res = await dsh.call("session.selectModel", { sessionId: sid, provider: pick.provider, model: pick.id });
+        const sel = res.selected;
+        return bot.feishu.sendMarkdown(chatId, chatId, `✅ 已切换模型：**${sel.provider}/${sel.model}**\n下一条手机消息将使用新模型。`);
+      } catch (err) {
+        return bot.feishu.sendMarkdown(chatId, chatId, `❌ 切换失败：${err.message}`);
+      }
+    }
+
+    const lines = [
+      `**当前会话模型**：${current ? `\`${current.provider}/${current.model}\`` : "（未知）"}`,
+      "",
+      "**可用模型**（发 /model <编号> 切换）：",
+    ];
+    let n = 0;
+    for (const g of groups) {
+      lines.push(`**${g.name || g.id}**`);
+      for (const m of g.models) {
+        n++;
+        const mark = isCur({ provider: g.id, id: m.id }) ? "▶️" : "　";
+        lines.push(`${mark} ${n}. \`${m.id}\`${m.name && m.name !== m.id ? `（${m.name}）` : ""}`);
+      }
+    }
+    if (!n) lines.push("　（无可用模型）");
+    if (Array.isArray(models.failures)) for (const f of models.failures) lines.push(`⚠️ ${f.name}: ${f.message}`);
+    lines.push("", "例：/model 3 切换为第 3 个模型。");
+    return bot.feishu.sendMarkdown(chatId, chatId, lines.join("\n"));
+  }
+
   async function handleFeishuMessage(bot, { openId, chatId, text, messageId, messageType = "text", contentRaw = "" }) {
     if (!messageId) return;
     const key = `${bot.cfg.appId}:${messageId}`;
@@ -342,6 +404,10 @@ export function apply(ctx) {
       const cmd = cmdLine.toLowerCase().split(/\s+/)[0];
       if (cmd === "/help") return bot.feishu.sendMarkdown(chatId, chatId, HELP);
       if (cmd === "/list") return listWorkspaceSessions(bot, chatId);
+      if (cmd === "/model" || cmd === "/models") {
+        const arg = cmdLine.slice(cmd.length).trim();
+        return handleModelCommand(bot, chatId, arg);
+      }
       if (cmd === "/timer") {
         const m = cmdLine.match(/^\/timer\s+(\d+(?:\.\d+)?)\s+(.+)$/s);
         if (!m) return bot.feishu.sendMarkdown(chatId, chatId, "用法：/timer <分钟> <内容>，如：/timer 10 提醒我喝水");
