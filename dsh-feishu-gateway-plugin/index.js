@@ -87,18 +87,19 @@ export function apply(ctx) {
     return cur && cur.provider && cur.model ? { provider: cur.provider, model: cur.model } : undefined;
   };
 
-  /** sessionId of the most recently active session in the bot's workspace. */
+  /** sessionId of the most recently active NON-ARCHIVED session in the bot's workspace. */
   async function currentSessionId(cfg) {
     const path = cfg.workspace || workspaceRoot() || "";
     const target = norm(path);
     if (!target) return undefined;
     try {
-      const { items: wsList } = await dsh.call("workspace.list", {});
+      const { items: wsList, archivedSessionIds = [] } = await dsh.call("workspace.list", {});
       const ws = wsList.find((w) => norm(w.path) === target);
       if (!ws) return undefined;
+      const archived = new Set(archivedSessionIds ?? []);
       const { items: sessions } = await dsh.call("session.list", {});
       const ids = new Set(ws.sessionIds ?? []);
-      const inWs = sessions.filter((s) => ids.has(s.sessionId));
+      const inWs = sessions.filter((s) => ids.has(s.sessionId) && !archived.has(s.sessionId));
       if (!inWs.length) return undefined;
       inWs.sort((a, b) => b.updatedAt - a.updatedAt);
       return inWs[0].sessionId;
@@ -240,19 +241,23 @@ export function apply(ctx) {
     return list.length;
   }
 
-  /** List the workspace's sessions the way the desktop sidebar does. */
+  /** List the workspace's sessions the way the desktop sidebar does (archived excluded). */
   async function listWorkspaceSessions(bot, chatId) {
     const path = bot.cfg.workspace || workspaceRoot() || "";
     const target = norm(path);
     try {
-      const { items: wsList } = await dsh.call("workspace.list", {});
+      const { items: wsList, archivedSessionIds = [] } = await dsh.call("workspace.list", {});
       const ws = wsList.find((w) => norm(w.path) === target);
       if (!ws) {
         return bot.feishu.sendMarkdown(chatId, chatId, `未找到工作区：${path || "（未配置）"}`);
       }
+      const archived = new Set(archivedSessionIds ?? []);
       const { items: sessions } = await dsh.call("session.list", {});
       const ids = new Set(ws.sessionIds ?? []);
-      const rows = sessions.filter((s) => ids.has(s.sessionId)).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 15);
+      const rows = sessions
+        .filter((s) => ids.has(s.sessionId) && !archived.has(s.sessionId))
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, 15);
       const current = await currentSessionId(bot.cfg);
       const lines = [`**工作区「${ws.title}」的会话**（▶️ = 当前，手机消息将进入）：`, ""];
       for (const s of rows) {
@@ -264,7 +269,7 @@ export function apply(ctx) {
         const mark = s.sessionId === current ? "▶️" : "⏸️";
         lines.push(`${mark} ${title || "（无标题）"}（${s.sessionId.slice(-8)}）`);
       }
-      lines.push("", "在电脑端打开某个会话，手机发消息就会进入它。");
+      lines.push("", "在电脑端打开某个会话，手机发消息就会进入它。", "（已归档会话与电脑端一致，不在此显示）");
       return bot.feishu.sendMarkdown(chatId, chatId, lines.join("\n"));
     } catch (err) {
       return bot.feishu.sendMarkdown(chatId, chatId, `❌ 查询失败：${err.message}`);
