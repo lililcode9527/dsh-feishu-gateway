@@ -1,5 +1,8 @@
 # Phase 2 深度集成插件设计（dsh-feishu-gateway-plugin）
 
+> ⚠️ **归档说明**：本文是 v1 阶段（专用会话池模型）的设计稿，**其中的"专用会话/每聊天会话池/绝不进入 GUI 当前会话流"描述已被推翻**。
+> 现版本（v0.3+）采用**桌面当前会话注入**模型：手机消息直接进入电脑端当前打开的会话（bot 工作区最近活动、非归档），支持 `/switch` 固定/恢复目标、`/model` 切模型、图片/文件接收、掉线告警。请以根 `README.md` 与 `使用文档.md` 为准；本文保留仅供理解架构演进与内部服务 API 参考。
+
 > 目标：把 feishu-gateway 从独立进程转换为 DSH 深度集成插件（ctx.agents 会话隔离 + 原生 feishu_send + 管理路由 + client 设置页 UI），保留全部现有能力（审批卡片/提问/进度/图片/文件/Markdown 卡片/多机器人/白名单）。
 >
 > **进度（round 1）**：✅ 插件 v1 已实现（专用会话池/工作区绑定/模型注入、agent.send+whenIdle 驱动、进度轮询、mux 提问/审批、feishu_send 原生、管理路由、自托管设置面板 UI + 扫码建机器人设备流），13/13 单测通过，已推送 GitHub。⏳ 待安装到 web profile 并端到端实测（需 pnpm + 重启 dsh web）。
@@ -88,5 +91,5 @@ DSH web profile（宿主进程）
 
 ## 7. 限制与取舍
 - 提问/审批依赖 api-proxy 的 provider（web profile 必有）；若在无 api-proxy 的自定义 profile 运行则失效（可接受）。
-- 专用会话在 GUI 侧边栏可见（工作区视图内），但绝不进入 GUI 的当前会话流。
+- ~~专用会话在 GUI 侧边栏可见（工作区视图内），但绝不进入 GUI 的当前会话流。~~（已推翻：现版本手机消息**直接进入** GUI 当前会话流，见归档说明）
 - 插件在 DSH 进程内运行：异常需 try/catch 兜底（沿用 dsh-feishu-connect 的 ctx.effect 清理模式）。

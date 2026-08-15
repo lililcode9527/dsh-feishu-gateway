@@ -84,22 +84,21 @@ export { apply, inject, name };
 - 安装：手动复制或 `dsh plugin add`；随 dsh web 启动，无需单独自启。
 - 风险：低（逻辑不变）；代价：会话仍由 /api 创建（与 GUI 共享工作区，同现状）。
 
-### Phase 2：深度集成（对齐 dsh-feishu-connect）
-- 用 `ctx.agents` 创建/恢复会话（**每聊天会话池、工作区绑定、模型注入**，彻底不串 GUI）。
-- 用 `ctx.userQuestions`（提问）、approval 服务（审批）原生处理，不再走 /api/respond。
-- **client 插件**（client.js）：设置页 UI（机器人列表/扫码创建/测试发送），inject `slots/layout/sessions/workspaces/locale`。
+### Phase 2：深度集成（已实施，现版本形态）
+- 用 `ctx.agents` 创建/恢复会话：**手机消息直接进入桌面当前会话**（bot 工作区内的最近活动非归档会话，即"当前会话注入"模型，不建专用会话池），并支持 `/switch` 固定/恢复消息目标。
+- 提问/审批走 api-proxy 的 mux + `/api/respond`（**未**改走 `ctx.userQuestions`/approval 服务，复用独立版已验证的 pending 逻辑）。
+- **管理路由 + 自托管 HTML 设置面板**（`/feishu/admin/panel`，含扫码建机器人），非 client 插件槽位。
 - feishu_send 原生（Phase 1 已做）。
-- 风险：中高（依赖内部服务 API，需随 DSH 版本演进）；收益：安装体验/设置页/会话隔离最完整。
+- 后续新增：`/model` 切模型（`session.selectModel`）、图片/文件接收、掉线告警（WS onReconnecting/onError → 私聊通知）。
 
-### 取舍速览
-| 维度 | 独立进程（现状） | Phase 1 插件 | Phase 2 深度插件 |
-|---|---|---|---|
-| 安装 | 复制目录+自启 | 复制/一行命令，随 dsh 启动 | 一行命令，随 dsh 启动 |
-| 稳定性 | 与 DSH 隔离 | 在 DSH 进程内（异常互影响） | 同左 |
-| feishu_send | 需伴生插件+收件口 | 原生工具 | 原生工具 |
-| 设置页 UI | ❌ | ❌ | ✅（扫码/多bot/测试发送） |
-| 会话隔离 | 工作区级 | 工作区级 | Agent 级（不串 GUI） |
-| 工作量 | — | 低（1 天级） | 高（数天级） |
+### 取舍速览（最终形态）
+| 维度 | 独立进程（已废弃） | 本插件（现版本） |
+|---|---|---|
+| 安装 | 复制目录+自启 | `dsh plugin add`，随 dsh 启动 |
+| 稳定性 | 与 DSH 隔离 | 在 DSH 进程内（异常互影响） |
+| feishu_send | 需伴生插件+收件口 | 原生工具 |
+| 设置页 UI | ❌ | ✅（自托管 HTML：扫码/多bot/测试发送） |
+| 会话模型 | 工作区级 | 桌面当前会话注入（+ /switch 固定） |
 
 ## 6. 参考资源
 - 已装插件：`~/.dsh/profiles/web/node_modules/dsh-feishu-gateway-plugin/`（本项目插件，含工具注册/管理路由/设置面板范例）
