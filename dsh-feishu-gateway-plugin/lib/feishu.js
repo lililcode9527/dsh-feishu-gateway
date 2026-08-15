@@ -220,6 +220,22 @@ export class FeishuBot {
     return { data: buf.toString("base64"), mediaType: "image/png" };
   }
 
+  /** Download a file resource from a received message (buffer + content-type hint). */
+  async downloadFile(messageId, fileKey) {
+    if (this.dryRun) throw new Error("dry-run has no client");
+    if (!this.client) throw new Error("feishu client not initialized");
+    const res = await this.client.im.v1.messageResource.get({
+      path: { message_id: messageId, file_key: fileKey },
+      params: { type: "file" },
+    });
+    const stream = res?.getReadableStream?.();
+    if (!stream) throw new Error("message resource returned no stream");
+    const chunks = [];
+    for await (const c of stream) chunks.push(c);
+    const contentType = res?.contentType || res?.headers?.["content-type"] || "";
+    return { buffer: Buffer.concat(chunks), contentType };
+  }
+
   /** Send a markdown card and return its message id (for later updates). */
   async sendCard(chatId, text) {
     const card = { config: { wide_screen_mode: true }, elements: [{ tag: "markdown", content: text }] };

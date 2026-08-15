@@ -25,6 +25,27 @@ const configPath = () => join(baseConfigDir(), "config.json");
 
 const norm = (p) => (typeof p === "string" ? p.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() : "");
 
+/** Best-effort file extension for a content-type (used when Feishu gives no file name). */
+const EXT_BY_MIME = {
+  "application/pdf": ".pdf",
+  "application/msword": ".doc",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+  "application/vnd.ms-excel": ".xls",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+  "application/vnd.ms-powerpoint": ".ppt",
+  "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+  "text/plain": ".txt",
+  "text/csv": ".csv",
+  "text/markdown": ".md",
+  "application/json": ".json",
+  "application/zip": ".zip",
+  "application/x-zip-compressed": ".zip",
+  "application/x-rar-compressed": ".rar",
+};
+function extFor(mime) {
+  return EXT_BY_MIME[String(mime || "").toLowerCase().split(";")[0].trim()] || ".bin";
+}
+
 function readJson(file, fallback) {
   try {
     if (existsSync(file)) return JSON.parse(readFileSync(file, "utf8").replace(/^\uFEFF/, "")); // strip UTF-8 BOM
@@ -509,8 +530,9 @@ export function apply(ctx) {
       return bot.feishu.sendMarkdown(chatId, chatId, "未知命令，发送 /help 查看。");
     }
 
-    // non-text handling: images are downloaded and handed to the agent (看图)
+    // non-text handling: images/files are downloaded and handed to the agent
     let contentBlocks = [];
+    let receivedFileLabel = "";
     if (messageType === "image") {
       let imageKey = "";
       try {
@@ -524,8 +546,48 @@ export function apply(ctx) {
         console.log(`[feishu-gw] image download failed: ${err.message}`);
         return bot.feishu.sendMarkdown(chatId, chatId, `❌ 图片下载失败：${err.message}`);
       }
+    } else if (messageType === "file") {
+      // save into <workspace>/.feishu-uploads/<date>/ so the agent can read it
+      let fileKey = "";
+      let fileName = "";
+      try {
+        const parsed = JSON.parse(contentRaw || "{}");
+        fileKey = parsed.file_key || "";
+        fileName = typeof parsed.file_name === "string" ? parsed.file_name.trim() : "";
+      } catch {}
+      if (!fileKey) return bot.feishu.sendMarkdown(chatId, chatId, "收到文件但无法解析（file_key 缺失）。");
+      const base = bot.cfg.workspace || workspaceRoot() || process.cwd();
+      const day = new Date().toISOString().slice(0, 10);
+      const dir = join(base, ".feishu-uploads", day);
+      let buffer;
+      let mime = "";
+      try {
+        mkdirSync(dir, { recursive: true });
+        const dl = await bot.feishu.downloadFile(messageId, fileKey);
+        buffer = dl.buffer;
+        mime = dl.contentType || "";
+      } catch (err) {
+        console.log(`[feishu-gw] file download failed: ${err.message}`);
+        return bot.feishu.sendMarkdown(chatId, chatId, `❌ 文件下载失败：${err.message}`);
+      }
+      if (buffer.length === 0) return bot.feishu.sendMarkdown(chatId, chatId, "❌ 下载的文件为空。");
+      if (buffer.length > 20 * 1024 * 1024) return bot.feishu.sendMarkdown(chatId, chatId, "❌ 文件超过 20MB，暂不支持。");
+      const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15); // yyyyMMddHHmmss
+      const safeName = (fileName || `feishu_${stamp}${extFor(mime)}`).replace(/[\\/:*?"<>|]/g, "_").slice(0, 120);
+      const filePath = join(dir, safeName);
+      try {
+        writeFileSync(filePath, buffer);
+      } catch (err) {
+        return bot.feishu.sendMarkdown(chatId, chatId, `❌ 保存文件失败：${err.message}`);
+      }
+      const rel = filePath.startsWith(base) ? filePath.slice(base.length).replace(/^[\\/]+/, "") : filePath;
+      receivedFileLabel = basename(filePath);
+      contentBlocks.push({
+        type: "text",
+        text: `[飞书文件 ${openId}] 收到文件「${basename(filePath)}」，已保存到 ${rel}，请读取文件内容并处理（如总结、提取关键信息等）。`,
+      });
     } else if (messageType !== "text") {
-      // audio/file/other: ignore for now
+      // audio/other: ignore for now
       return;
     }
     if (messageType === "text") {
@@ -544,7 +606,7 @@ export function apply(ctx) {
     }
     sessionOwner.set(sessionId, { botName: bot.cfg.name, chatId, openId });
 
-    await bot.feishu.sendMarkdown(chatId, chatId, "🤖 已收到，开始处理…");
+    await bot.feishu.sendMarkdown(chatId, chatId, receivedFileLabel ? `🤖 已收到文件「${receivedFileLabel}」，开始处理…` : "🤖 已收到，开始处理…");
     const seqBefore = agent.session.events.length;
     const message = { id: `feishu-${messageId}`, role: "user", content: contentBlocks, source: { kind: "user" } };
     agent.send(message, "next-turn", true);
