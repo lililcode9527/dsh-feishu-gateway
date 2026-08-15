@@ -74,6 +74,7 @@ export function apply(ctx) {
         appSecret: typeof b.appSecret === "string" ? b.appSecret : "",
         allowedOpenIds: Array.isArray(b.allowedOpenIds) ? b.allowedOpenIds : [],
         ownerOpenId: typeof b.ownerOpenId === "string" ? b.ownerOpenId : "",
+        targetSessionId: typeof b.targetSessionId === "string" ? b.targetSessionId : "",
       });
     }
     return out;
@@ -87,7 +88,11 @@ export function apply(ctx) {
     return cur && cur.provider && cur.model ? { provider: cur.provider, model: cur.model } : undefined;
   };
 
-  /** sessionId of the most recently active NON-ARCHIVED session in the bot's workspace. */
+  /**
+   * sessionId the phone messages enter: the fixed /switch target when one is
+   * set and still valid, else the most recently active NON-ARCHIVED session in
+   * the bot's workspace (the desktop's current session approximation).
+   */
   async function currentSessionId(cfg) {
     const path = cfg.workspace || workspaceRoot() || "";
     const target = norm(path);
@@ -99,6 +104,9 @@ export function apply(ctx) {
       const archived = new Set(archivedSessionIds ?? []);
       const { items: sessions } = await dsh.call("session.list", {});
       const ids = new Set(ws.sessionIds ?? []);
+      if (cfg.targetSessionId && ids.has(cfg.targetSessionId) && !archived.has(cfg.targetSessionId)) {
+        return cfg.targetSessionId;
+      }
       const inWs = sessions.filter((s) => ids.has(s.sessionId) && !archived.has(s.sessionId));
       if (!inWs.length) return undefined;
       inWs.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -107,6 +115,29 @@ export function apply(ctx) {
       console.log(`[feishu-gw] currentSessionId failed: ${err.message}`);
       return undefined;
     }
+  }
+
+  /** All visible (non-archived) sessions across every workspace, flat, with titles. */
+  async function collectAllSessions() {
+    const { items: wsList, archivedSessionIds = [] } = await dsh.call("workspace.list", {});
+    const archived = new Set(archivedSessionIds ?? []);
+    const { items: sessions } = await dsh.call("session.list", {});
+    const flat = [];
+    for (const ws of wsList) {
+      const ids = new Set(ws.sessionIds ?? []);
+      const rows = sessions
+        .filter((s) => ids.has(s.sessionId) && !archived.has(s.sessionId))
+        .sort((a, b) => b.updatedAt - a.updatedAt);
+      for (const s of rows) {
+        let title = "";
+        try {
+          const h = await dsh.call("session.history", { sessionId: s.sessionId });
+          title = h.projections?.values?.title ?? "";
+        } catch {}
+        flat.push({ wsTitle: ws.title, sessionId: s.sessionId, title });
+      }
+    }
+    return flat;
   }
 
   /** agentOptions for a session: its own stored model selection, else the deployment default. */
@@ -224,6 +255,7 @@ export function apply(ctx) {
     "",
     "直接发消息/图片 = 进入电脑端**当前打开的会话**（手机与桌面同一对话）。",
     "/list — 查看所有工作区及会话（同电脑端侧边栏）",
+    "/switch — 切换手机消息目标会话；/switch <编号> 固定，/switch 恢复自动跟随",
     "/model — 查看当前模型与可用列表；/model <编号> 切换模型",
     "/timer <分钟> <内容> — 定时提醒（如：/timer 10 提醒我喝水）",
     "/cancel — 取消本聊天的定时提醒并中断当前回合",
@@ -251,45 +283,88 @@ export function apply(ctx) {
     return list.length;
   }
 
-  /** List ALL workspaces with their sessions (archived excluded), like the desktop sidebar. */
+  /** List ALL workspaces with their sessions (archived excluded), numbered for /switch. */
   async function listWorkspaceSessions(bot, chatId) {
     try {
-      const { items: wsList, archivedSessionIds = [] } = await dsh.call("workspace.list", {});
+      const { items: wsList } = await dsh.call("workspace.list", {});
       if (!wsList.length) {
         return bot.feishu.sendMarkdown(chatId, chatId, "还没有任何工作区。");
       }
-      const archived = new Set(archivedSessionIds ?? []);
-      const { items: sessions } = await dsh.call("session.list", {});
+      const flat = await collectAllSessions();
       const current = await currentSessionId(bot.cfg);
-      const lines = [`**所有工作区的会话**（▶️ = 当前，手机消息将进入）：`, ""];
-      const MAX_PER_WS = 10;
+      const fixed = bot.cfg.targetSessionId;
+      const lines = [`**所有工作区的会话**（▶️ = 当前消息目标）：`, ""];
+      let n = 0;
       for (const ws of wsList) {
-        const ids = new Set(ws.sessionIds ?? []);
-        const rows = sessions
-          .filter((s) => ids.has(s.sessionId) && !archived.has(s.sessionId))
-          .sort((a, b) => b.updatedAt - a.updatedAt);
-        lines.push(`📁 **${ws.title}**（${rows.length}）`);
-        if (!rows.length) {
+        const wsRows = flat.filter((f) => f.wsTitle === ws.title);
+        lines.push(`📁 **${ws.title}**（${wsRows.length}）`);
+        if (!wsRows.length) {
           lines.push("　（无会话）");
         } else {
-          for (const s of rows.slice(0, MAX_PER_WS)) {
-            let title = "";
-            try {
-              const h = await dsh.call("session.history", { sessionId: s.sessionId });
-              title = h.projections?.values?.title ?? "";
-            } catch {}
-            const mark = s.sessionId === current ? "▶️" : "⏸️";
-            lines.push(`　${mark} ${title || "（无标题）"}（${s.sessionId.slice(-8)}）`);
+          for (const f of wsRows) {
+            n++;
+            const mark = f.sessionId === (fixed || current) ? "▶️" : "　";
+            lines.push(`${mark} ${n}. ${f.title || "（无标题）"}（${f.sessionId.slice(-8)}）`);
           }
-          if (rows.length > MAX_PER_WS) lines.push(`　…等共 ${rows.length} 个会话`);
         }
         lines.push("");
       }
-      lines.push("在电脑端打开某个会话，手机发消息就会进入它。", "（已归档会话与电脑端一致，不在此显示）");
+      lines.push(
+        fixed
+          ? `📌 已固定消息目标（发 /switch 恢复自动跟随电脑端当前会话）`
+          : "手机消息自动进入电脑端当前会话；发 /switch <编号> 可固定目标。",
+        "（已归档会话与电脑端一致，不在此显示）"
+      );
       return bot.feishu.sendMarkdown(chatId, chatId, lines.join("\n"));
     } catch (err) {
       return bot.feishu.sendMarkdown(chatId, chatId, `❌ 查询失败：${err.message}`);
     }
+  }
+
+  /** Persist the bot's fixed message-target session; empty string clears it. */
+  async function setTargetSession(bot, sessionId) {
+    const raw = readJson(configPath(), {});
+    const list = Array.isArray(raw.bots) ? raw.bots : [];
+    const idx = list.findIndex((b) => b && b.appId === bot.cfg.appId);
+    const patch = { targetSessionId: sessionId };
+    if (idx >= 0) list[idx] = { ...list[idx], ...patch };
+    else list.push({ ...bot.cfg, ...patch });
+    writeJson(configPath(), { bots: list });
+    lastConfigCheck = 0;
+    await ensureBots(); // reload so bot.cfg picks up the new target
+  }
+
+  /** /switch — list sessions (numbered) or fix the phone message target. */
+  async function handleSwitchCommand(bot, chatId, arg) {
+    const flat = await collectAllSessions();
+    if (!flat.length) return bot.feishu.sendMarkdown(chatId, chatId, "没有任何可用会话。");
+    if (!arg) {
+      const current = await currentSessionId(bot.cfg);
+      const fixed = bot.cfg.targetSessionId;
+      const lines = [`**切换手机消息目标会话**（发 /switch <编号> 固定）：`, ""];
+      flat.forEach((f, i) => {
+        const mark = f.sessionId === (fixed || current) ? "▶️" : "　";
+        lines.push(`${mark} ${i + 1}. ${f.wsTitle} / ${f.title || "（无标题）"}（${f.sessionId.slice(-8)}）`);
+      });
+      lines.push(
+        "",
+        fixed
+          ? `📌 当前已固定：${flat.find((f) => f.sessionId === fixed)?.title || fixed}\n发 /switch（无编号）恢复自动跟随电脑端当前会话。`
+          : "发 /switch（无编号）可随时回到自动跟随电脑端当前会话。"
+      );
+      return bot.feishu.sendMarkdown(chatId, chatId, lines.join("\n"));
+    }
+    const idx = Number(arg);
+    if (!Number.isInteger(idx) || idx < 1 || idx > flat.length) {
+      return bot.feishu.sendMarkdown(chatId, chatId, `❌ 参数无效：编号范围 1-${flat.length}（发 /switch 查看列表）`);
+    }
+    const pick = flat[idx - 1];
+    await setTargetSession(bot, pick.sessionId);
+    return bot.feishu.sendMarkdown(
+      chatId,
+      chatId,
+      `✅ 已固定消息目标：**${pick.wsTitle} / ${pick.title || "（无标题）"}**\n手机消息将进入该会话。\n发 /switch 可恢复自动跟随电脑端当前会话。`
+    );
   }
 
   /** Show current session model + selectable list, or switch by index (/model <N>). */
@@ -404,6 +479,10 @@ export function apply(ctx) {
       const cmd = cmdLine.toLowerCase().split(/\s+/)[0];
       if (cmd === "/help") return bot.feishu.sendMarkdown(chatId, chatId, HELP);
       if (cmd === "/list") return listWorkspaceSessions(bot, chatId);
+      if (cmd === "/switch") {
+        const arg = cmdLine.slice(cmd.length).trim();
+        return handleSwitchCommand(bot, chatId, arg);
+      }
       if (cmd === "/model" || cmd === "/models") {
         const arg = cmdLine.slice(cmd.length).trim();
         return handleModelCommand(bot, chatId, arg);
@@ -711,6 +790,7 @@ export function apply(ctx) {
           appSecret: String(b.appSecret || "").trim() || (prev ? prev.appSecret : ""),
           allowedOpenIds: Array.isArray(b.allowedOpenIds) ? b.allowedOpenIds : [],
           ownerOpenId: String(b.ownerOpenId || "").trim() || (prev ? prev.ownerOpenId : ""),
+          targetSessionId: String(b.targetSessionId || "").trim() || (prev ? prev.targetSessionId || "" : ""),
         };
       });
     writeJson(configPath(), { bots: next });
