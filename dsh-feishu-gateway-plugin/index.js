@@ -214,7 +214,7 @@ export function apply(ctx) {
     "**飞书网关**",
     "",
     "直接发消息/图片 = 进入电脑端**当前打开的会话**（手机与桌面同一对话）。",
-    "/list — 查看工作区会话（同电脑端侧边栏）",
+    "/list — 查看所有工作区及会话（同电脑端侧边栏）",
     "/timer <分钟> <内容> — 定时提醒（如：/timer 10 提醒我喝水）",
     "/cancel — 取消本聊天的定时提醒并中断当前回合",
     "需要授权时点卡片按钮，提问回复编号即可。",
@@ -241,35 +241,41 @@ export function apply(ctx) {
     return list.length;
   }
 
-  /** List the workspace's sessions the way the desktop sidebar does (archived excluded). */
+  /** List ALL workspaces with their sessions (archived excluded), like the desktop sidebar. */
   async function listWorkspaceSessions(bot, chatId) {
-    const path = bot.cfg.workspace || workspaceRoot() || "";
-    const target = norm(path);
     try {
       const { items: wsList, archivedSessionIds = [] } = await dsh.call("workspace.list", {});
-      const ws = wsList.find((w) => norm(w.path) === target);
-      if (!ws) {
-        return bot.feishu.sendMarkdown(chatId, chatId, `未找到工作区：${path || "（未配置）"}`);
+      if (!wsList.length) {
+        return bot.feishu.sendMarkdown(chatId, chatId, "还没有任何工作区。");
       }
       const archived = new Set(archivedSessionIds ?? []);
       const { items: sessions } = await dsh.call("session.list", {});
-      const ids = new Set(ws.sessionIds ?? []);
-      const rows = sessions
-        .filter((s) => ids.has(s.sessionId) && !archived.has(s.sessionId))
-        .sort((a, b) => b.updatedAt - a.updatedAt)
-        .slice(0, 15);
       const current = await currentSessionId(bot.cfg);
-      const lines = [`**工作区「${ws.title}」的会话**（▶️ = 当前，手机消息将进入）：`, ""];
-      for (const s of rows) {
-        let title = "";
-        try {
-          const h = await dsh.call("session.history", { sessionId: s.sessionId });
-          title = h.projections?.values?.title ?? "";
-        } catch {}
-        const mark = s.sessionId === current ? "▶️" : "⏸️";
-        lines.push(`${mark} ${title || "（无标题）"}（${s.sessionId.slice(-8)}）`);
+      const lines = [`**所有工作区的会话**（▶️ = 当前，手机消息将进入）：`, ""];
+      const MAX_PER_WS = 10;
+      for (const ws of wsList) {
+        const ids = new Set(ws.sessionIds ?? []);
+        const rows = sessions
+          .filter((s) => ids.has(s.sessionId) && !archived.has(s.sessionId))
+          .sort((a, b) => b.updatedAt - a.updatedAt);
+        lines.push(`📁 **${ws.title}**（${rows.length}）`);
+        if (!rows.length) {
+          lines.push("　（无会话）");
+        } else {
+          for (const s of rows.slice(0, MAX_PER_WS)) {
+            let title = "";
+            try {
+              const h = await dsh.call("session.history", { sessionId: s.sessionId });
+              title = h.projections?.values?.title ?? "";
+            } catch {}
+            const mark = s.sessionId === current ? "▶️" : "⏸️";
+            lines.push(`　${mark} ${title || "（无标题）"}（${s.sessionId.slice(-8)}）`);
+          }
+          if (rows.length > MAX_PER_WS) lines.push(`　…等共 ${rows.length} 个会话`);
+        }
+        lines.push("");
       }
-      lines.push("", "在电脑端打开某个会话，手机发消息就会进入它。", "（已归档会话与电脑端一致，不在此显示）");
+      lines.push("在电脑端打开某个会话，手机发消息就会进入它。", "（已归档会话与电脑端一致，不在此显示）");
       return bot.feishu.sendMarkdown(chatId, chatId, lines.join("\n"));
     } catch (err) {
       return bot.feishu.sendMarkdown(chatId, chatId, `❌ 查询失败：${err.message}`);
